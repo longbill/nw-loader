@@ -25,10 +25,13 @@ class NWLoader {
 
 		}, options);
 
+		if (this.options.ttl < 2) throw new Error('NWLoader need ttl greater than 2 seconds');
+
 		// Redis instance is now mandatory
 		if (!this.options.redis) {
 			throw new Error('NWLoader now requires a Redis-like instance. The `redis` option must be provided.');
 		}
+
 		// Store the redis instance directly
 		this.redis = this.options.redis;
 
@@ -58,29 +61,6 @@ class NWLoader {
 	}
 
 	/**
-	 * Check if cached data is expired by examining the Redis key's TTL
-	 * This is more reliable than time-based checks as it uses Redis's built-in expiration mechanism
-	 * @param {string} key - The Redis key to check
-	 * @returns {Promise<boolean>} - True if key is expired or missing, false otherwise
-	 */
-	async isExpiredByKey(key) {
-		try {
-			// TTL command returns:
-			// -1 if the key exists but has no associated expire
-			// -2 if the key does not exist
-			// Otherwise, the TTL in seconds
-			const ttl = await this.redis.ttl(key);
-			
-			// Key is expired or doesn't exist
-			return ttl === -1 || ttl === -2;
-		} catch (err) {
-			// If we can't get TTL, assume key is expired
-			console.warn(`Failed to get TTL for key ${key}, assuming expired`, err);
-			return true;
-		}
-	}
-
-	/**
 	 * Check if cached data needs to be refreshed using Redis key TTL
 	 * This avoids issues with time synchronization between application servers
 	 * 
@@ -97,7 +77,7 @@ class NWLoader {
 		try {
 			// Get Redis key TTL (-1 if key exists but no expire, -2 if key does not exist)
 			const ttl = await this.redis.ttl(key);
-			
+			debug('check ttl for', key, 'ttl=', ttl, 'options.ttl=', this.options.ttl);	
 			// If key doesn't exist or TTL indicates expired, needs refresh
 			if (ttl === -2) {
 				return true;
@@ -105,7 +85,7 @@ class NWLoader {
 			
 			// If TTL is less than user-configured TTL, it's time to refresh
 			// (Redis TTL is in seconds, user TTL is in seconds)
-			return ttl < this.options.ttl;
+			return ttl <= this.options.ttl;
 		} catch (err) {
 			// If we can't get TTL, assume cache needs refresh
 			console.warn('Failed to get Redis key TTL, assuming cache needs refresh', err);
@@ -134,6 +114,7 @@ class NWLoader {
 	 * - Redis key TTL is set to 2 * user TTL to allow serving stale data during refresh
 	 * - When Redis TTL < user TTL, it's time to refresh in background
 	 * - This approach avoids time synchronization issues between application servers
+	 * 
 	 */
 	async load(...args) {
 		let origKey = this.getBaseKey(args);
@@ -186,6 +167,7 @@ class NWLoader {
 								did = true;
 							}
 						} catch (err) {
+							// Cache the error with a shorter TTL to prevent infinite loops
 							if (typeof err === 'object') err.nw_loader = 1;
 							if (err && err.code) throw err;
 							if (typeof err !== 'object') err = new Error(err);
@@ -194,6 +176,8 @@ class NWLoader {
 						}
 					}, did);
 
+
+					// no error thrown and cache is primed
 					// If current request didn't execute the loader and no data has been returned yet,
 					// try to load again (this will read from cache which was just populated)
 					if (!executed && !did) {
@@ -205,9 +189,10 @@ class NWLoader {
 				if (!did) {
 					reject(err);
 				} else {
-					// If data already returned, just log the error
+					// If data already returned, just log the error (background update)
 					if (typeof err !== 'object') err = new Error(err);
 					err.message = `NWLoader ${this.name}:${key} Error: ${err.message}`;
+					err.code = 'nwloader-background-error';
 					console.error(err);
 				}
 			}
@@ -232,6 +217,24 @@ class NWLoader {
 		const result = await this.redis.set(key, serializedValue, 'EX', this.options.ttl * 2);
 		return result === 'OK';
 	}
+
+	//prime cache with error
+	// async primeError(origKey, error) {
+	// 	let key = this.getKey(origKey);
+	// 	// Store error with a shorter TTL to avoid infinite error loops
+	// 	const errorTTL = Math.min(this.options.ttl, 5); // Use minimum of configured TTL or 5 seconds
+	// 	const serializedValue = JSON.stringify({
+	// 		createTime: Date.now(),
+	// 		error: {
+	// 			message: error.message,
+	// 			code: error.code,
+	// 			stack: error.stack
+	// 		}
+	// 	});
+	// 	// 'EX' option for ioredis expects seconds
+	// 	const result = await this.redis.set(key, serializedValue, 'EX', errorTTL);
+	// 	return result === 'OK';
+	// }
 }
 
 

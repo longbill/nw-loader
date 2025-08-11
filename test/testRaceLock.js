@@ -1,86 +1,75 @@
-const Cache = require('../cache');
+const { describe, test, beforeEach, afterEach } = require('node:test');
 const Lock = require('../lock');
 const Redis = require('ioredis');
-// const NodeCache = require('node-cache');
-const pwait = require('pwait');
-const waitRand = () => pwait(Math.ceil( Math.random() * 20 ));
+const delay = require('delay');
+const assert = require('assert');
 
-let prefix = process.argv[3] || '';
-let log = console.log.bind(console);
+describe('Lock - race method', function() {
+	// Create a new Redis instance and Lock instance for each test run
+	// to ensure a clean state.
+	let redisClient;
+	let lock;
 
-let i = 0;
-let lastms = Date.now();
-let running = false;
-function getTime() {
-	let now = Date.now();
-	let re = now - lastms;
-	lastms = now;
-	return re + 'ms';
-}
-
-function createTask() {
-	let name = `task${prefix} ${(++i)}`;
-	return function(delayed) {
-		console.log(name + ' start,', (delayed ? 'delayed' : ''), getTime());
-		if (running) throw new Error('running is true');
-		running = true;
-		//results.push(name + ' start ' + getTime());
-		return waitRand().then(() => {
-			// if (Math.random() > 0.9) throw new Error('random error for ' + name);
-			//results.push(name + ' end ' + getTime());
-			console.log(name + ' done', getTime());
-			running = false;
-		});
-	};
-}
-
-const redis = new Redis(process.env.REDIS_URL);
-// const nodeCache = new NodeCache();
-let cache = new Cache(redis);
-// let cache = new Cache(nodeCache);
-let lock = new Lock(cache, {
-	defaultTimeout: 1000 
-});
-
-
-describe('test lock', function() {
-	this.timeout(20000);
-
-	it('should test lock', () => {
-		return Promise.all([
-			lock.race('lock1', createTask()),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask(), true)).then(log),
-			waitRand().then(() => lock.race('lock1', createTask(), true)).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			waitRand().then(() => lock.race('lock1', createTask())).then(log),
-			lock.race('lock1', createTask())
-		]).then(() => {
-			return Promise.all([
-				lock.race('lock1', createTask()),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				waitRand().then(() => lock.race('lock1', createTask())).then(log),
-				lock.race('lock1', createTask())
-			]);
+	beforeEach(() => {
+		// Use a unique Redis URL if provided, otherwise default to localhost
+		const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+		redisClient = new Redis(redisUrl);
+		// Create a lock instance with a reasonable default timeout for testing
+		lock = new Lock(redisClient, {
+			defaultTimeout: 5000,
+			checkLockDelay: 20 // Speed up tests a bit
 		});
 	});
+
+	afterEach(async () => {
+		// Clean up Redis connection after each test
+		if (redisClient) {
+			// Optionally clear any test keys here if needed, though the lock
+			// mechanism should handle cleanup.
+			// For example: await redisClient.del('nwlock:test-lock-sequential');
+			await redisClient.quit();
+		}
+	});
+
+	test('should execute only one task when multiple tasks race for the same lock key', async () => {
+		
+		const results = [];
+		const lockKey = 'test-race-lock-single-exec';
+
+		// Create tasks that record their execution
+		const createTask = (id) => {
+			return async () => {
+				results.push({ id, status: 'executed', at: Date.now() });
+				// Simulate some work
+				await delay(100);
+				return `result-${id}`;
+			};
+		};
+
+		// Start multiple tasks concurrently with the same lock key
+		const task1 = lock.race(lockKey, createTask('A'));
+		const task2 = lock.race(lockKey, createTask('B'));
+		const task3 = lock.race(lockKey, createTask('C'));
+
+		const [result1, result2, result3] = await Promise.all([task1, task2, task3]);
+
+		// Assertions for return values
+		// Only one task should have executed (executed: true)
+		const executedTasks = [result1, result2, result3].filter(res => res.executed);
+		assert.strictEqual(executedTasks.length, 1, 'Only one task should have been executed');
+
+		const executedResult = executedTasks[0];
+		assert(executedResult.result.startsWith('result-'), 'The executed task should return a proper result');
+
+		// The other tasks should not have been executed (executed: false)
+		const nonExecutedTasks = [result1, result2, result3].filter(res => !res.executed);
+		assert.strictEqual(nonExecutedTasks.length, 2, 'Two tasks should not have been executed');
+		assert.strictEqual(nonExecutedTasks[0].result, null);
+		assert.strictEqual(nonExecutedTasks[1].result, null);
+
+		// Verify execution results array
+		assert.strictEqual(results.length, 1, 'Only one task should have added to the results array');
+		assert(results[0].id === 'A' || results[0].id === 'B' || results[0].id === 'C', 'The executed task ID should be one of A, B, or C');
+		console.log('Single execution race test passed with result:', executedResult, 'and non-executed tasks:', nonExecutedTasks);
+	});
 });
-
-
