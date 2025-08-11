@@ -1,5 +1,3 @@
-const NodeCache = require('node-cache');
-const NWCache = require('./cache');
 const NWLock = require('./lock');
 const debug = require('debug');
 const md5 = require('./md5');
@@ -8,7 +6,7 @@ class NWLoader {
 
 	constructor(name, loader, options) {
 
-		if (!name || !name.match(/^[a-z0-9\:\_\-\.]+$/i)) {
+		if (!name || !name.match(/^[a-z0-9\:\_\-\.\[\]]+$/i)) {
 			throw new Error('NWLoader need first argument to be a valid string');
 		}
 
@@ -16,7 +14,7 @@ class NWLoader {
 		this.loader = loader;
 		this.options = Object.assign({
 
-			//give the ioredis instance, or it will use in-memory cache(node-cache)
+			// Requires a Redis-like instance
 			redis: null,
 
 			//default expiration seconds
@@ -27,18 +25,16 @@ class NWLoader {
 
 		}, options);
 
-		//create cache instance
-		if (this.options.redis) {
-			this.cache = new NWCache(this.options.redis);
-		} else {
-			this.cache = new NWCache(new NodeCache({
-				stdTTL: this.options.ttl * 2  //default ttl of node-cache
-			}));
+		// Redis instance is now mandatory
+		if (!this.options.redis) {
+			throw new Error('NWLoader now requires a Redis-like instance. The `redis` option must be provided.');
 		}
+		// Store the redis instance directly
+		this.redis = this.options.redis;
 
 		this.debug = debug(`nwloader:${this.name}`);
-		this.timeouts = {};
-		this.lock = new NWLock(this.cache);
+		// Pass the ioredis instance directly to the lock
+		this.lock = new NWLock(this.redis);
 	}
 
 	/**
@@ -62,34 +58,129 @@ class NWLoader {
 	}
 
 	/**
-	 * load data from cache or loader
+	 * Check if cached data is expired by examining the Redis key's TTL
+	 * This is more reliable than time-based checks as it uses Redis's built-in expiration mechanism
+	 * @param {string} key - The Redis key to check
+	 * @returns {Promise<boolean>} - True if key is expired or missing, false otherwise
+	 */
+	async isExpiredByKey(key) {
+		try {
+			// TTL command returns:
+			// -1 if the key exists but has no associated expire
+			// -2 if the key does not exist
+			// Otherwise, the TTL in seconds
+			const ttl = await this.redis.ttl(key);
+			
+			// Key is expired or doesn't exist
+			return ttl === -1 || ttl === -2;
+		} catch (err) {
+			// If we can't get TTL, assume key is expired
+			console.warn(`Failed to get TTL for key ${key}, assuming expired`, err);
+			return true;
+		}
+	}
+
+	/**
+	 * Check if cached data needs to be refreshed using Redis key TTL
+	 * This avoids issues with time synchronization between application servers
+	 * 
+	 * Cache refresh strategy:
+	 * - Redis key TTL is set to 2 * user TTL (in prime method) to allow serving stale data
+	 * - When Redis TTL < user TTL, it means we're in the second half of the cache lifecycle
+	 * - During this time, we should refresh the cache in background while still serving stale data
+	 * - This allows for graceful degradation when the loader is slow or failing
+	 * 
+	 * @param {string} key - The Redis key to check
+	 * @returns {Promise<boolean>} - True if cache needs refresh, false otherwise
+	 */
+	async needsRefresh(key) {
+		try {
+			// Get Redis key TTL (-1 if key exists but no expire, -2 if key does not exist)
+			const ttl = await this.redis.ttl(key);
+			
+			// If key doesn't exist or TTL indicates expired, needs refresh
+			if (ttl === -2) {
+				return true;
+			}
+			
+			// If TTL is less than user-configured TTL, it's time to refresh
+			// (Redis TTL is in seconds, user TTL is in seconds)
+			return ttl < this.options.ttl;
+		} catch (err) {
+			// If we can't get TTL, assume cache needs refresh
+			console.warn('Failed to get Redis key TTL, assuming cache needs refresh', err);
+			return true;
+		}
+	}
+
+	
+
+	/**
+	 * Load data from cache or loader with smart caching strategy:
+	 * 1. Try to get data from cache first
+	 * 2. If cache miss or needs refresh, use race lock to ensure only one loader function executes
+	 * 3. Other concurrent requests either:
+	 *    - Return cached data immediately (if data already retrieved by another request)
+	 *    - Get ignored (if ignore=true, default) to avoid unnecessary waiting
+	 *    - Wait for lock release then retry cache read (if ignore=false)
+	 * 
+	 * This design ensures:
+	 * - Fast response for cache hits
+	 * - Only one loader execution for cache misses
+	 * - No unnecessary waiting for requests when data is already available
+	 * 
+	 * Cache refresh strategy:
+	 * - Uses Redis key TTL to determine when to refresh cache
+	 * - Redis key TTL is set to 2 * user TTL to allow serving stale data during refresh
+	 * - When Redis TTL < user TTL, it's time to refresh in background
+	 * - This approach avoids time synchronization issues between application servers
 	 */
 	async load(...args) {
 		let origKey = this.getBaseKey(args);
 		let key = this.getKey(origKey);
 
 		return new Promise(async (done, reject) => {
+			// did flag tracks whether the promise has been resolved (data returned to caller)
 			let did = false;
 			let v = null;
 			this.debug(`try to load ${key} from cache`);
 
 			try {
-				v = await this.cache.get(key);
+				// Use this.redis directly and handle JSON parsing
+				const rawValue = await this.redis.get(key);
+				if (rawValue !== null) {
+					try {
+						v = JSON.parse(rawValue);
+					} catch (parseErr) {
+						console.error(`NWLoader: Failed to parse cached value for key ${key}`, parseErr);
+						v = null;
+					}
+				}
+				
+				// If valid cached data found, return it immediately
 				if (v && v.createTime) {
 					this.debug(`got ${key} from cache`);
 					done(v.value);
-					did = true;
+					did = true; // Mark that data has been returned to caller
 				} else {
 					this.debug(`${key} not found in cache`);
 				}
 
-				if (!v || (v && v.createTime && Date.now() - v.createTime > this.options.ttl * 1000)) {
+				// Check if cache is missing or needs refresh
+				// Even if data is returned to caller, we still try to refresh cache in background
+				if (!v || await this.needsRefresh(key)) {
+					// Use race lock to ensure only one loader function executes
+					// Pass 'did' as ignore parameter:
+					// - If did=true (data already returned), other requests will be ignored (don't wait)
+					// - If did=false (no data returned yet), other requests will be ignored by default (fast fail)
 					let { executed } = await this.lock.race(origKey, async () => {
 						this.debug(`loading ${key} from loader`);
 						try {
+							// Execute loader function
 							let newData = await this.loader(...args);
 							this.debug(`set ${key} to cache`);
 							await this.prime(origKey, newData);
+							// Only return data if it hasn't been returned yet
 							if (!did) {
 								done(newData);
 								did = true;
@@ -103,14 +194,18 @@ class NWLoader {
 						}
 					}, did);
 
+					// If current request didn't execute the loader and no data has been returned yet,
+					// try to load again (this will read from cache which was just populated)
 					if (!executed && !did) {
 						this.load(origKey).then(done).catch(reject);
 					}
 				}
 			} catch (err) {
+				// Only reject if data hasn't been returned yet
 				if (!did) {
 					reject(err);
 				} else {
+					// If data already returned, just log the error
 					if (typeof err !== 'object') err = new Error(err);
 					err.message = `NWLoader ${this.name}:${key} Error: ${err.message}`;
 					console.error(err);
@@ -119,18 +214,23 @@ class NWLoader {
 		});
 	}
 
-	//清除缓存
-	clear(key) {
-		return this.cache.del(this.getKey(key)).then(r => r * 1);
+	//clear cache
+	async clear(key) {
+		const result = await this.redis.del(this.getKey(key));
+		return result > 0 ? 1 : 0;
 	}
 
-	//设置缓存
+	//prime cache
 	async prime(origKey, value) {
 		let key = this.getKey(origKey);
-		await this.cache.set(key, {
+		// Use this.redis directly and handle JSON serialization
+		const serializedValue = JSON.stringify({
 			createTime: Date.now(),
 			value
-		}, 'EX', this.options.ttl * 2);
+		});
+		// 'EX' option for ioredis expects seconds
+		const result = await this.redis.set(key, serializedValue, 'EX', this.options.ttl * 2);
+		return result === 'OK';
 	}
 }
 
@@ -139,6 +239,10 @@ module.exports = NWLoader;
 
 module.exports.cacheable = function(name, options) {
 	return function(origFunc) {
+		// Ensure options always includes redis instance for cacheable
+		if (!options || !options.redis) {
+			 throw new Error('cacheable decorator requires a Redis-like instance in options.redis');
+		}
 		let loader = new NWLoader(name, origFunc, options);
 		return function(...args) {
 			return loader.load(...args);
